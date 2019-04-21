@@ -1,0 +1,430 @@
+---
+title: "hierarchical model"
+author: "Christof Neumann"
+date: "`r Sys.Date()`"
+output: pdf_document
+fontsize: 10pt
+geometry: margin = 0.8in
+---
+
+```{r setup, include=FALSE}
+def.chunk.hook  <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- def.chunk.hook(x, options)
+  ifelse(options$size != "normalsize", paste0("\\", options$size,"\n\n", x, "\n\n \\normalsize"), x)
+})
+knitr::opts_chunk$set(size = 'footnotesize', fig.align = 'center', echo = TRUE)
+options(width = 118)
+```
+
+The idea is here to simulate a process that is truly hierarchical. To this end we will setup a process that ends in the generation of a response (*`resp`*). This response depends on a predictor, which in turn depends on a covariate.
+
+covariate $\longrightarrow$ predictor $\longrightarrow$ response
+
+response ~ (predictor ~ covariate)
+
+
+```{r packageload, message = FALSE, warning=FALSE}
+library(lme4)
+library(knitr)
+library(knitrProgressBar)
+library(RColorBrewer)
+```
+
+
+
+```{r}
+# sample sizes
+# number of countries/languages
+ngroups <- 90
+# number of subjects per country/language
+nsubj <- 100
+# and a scaffold for data set
+xdata <- expand.grid(subj = 1:nsubj, group = 1:ngroups)
+```
+
+We start with the first model, i.e. the covariate $\longrightarrow$ predictor part. First, we need to set up the model parameters. Except for the first two terms here (`covint` and `covslo`) these parameters need to positive numbers because they represent standard deviations.
+
+```{r}
+# parameters for the covariate -> predictor model
+covint <- -0.3         # intercept
+covslo <- -0.5         # global slope for cov on predictor ('latent1')
+covgroupint <- 3.1     # the group-level intercepts for the effect of covariate on predictor
+covgroupslo <- 0.9     # the group-level slopes for the effect of covariate on predictor
+coverror <- 2.7        # 'error' term
+```
+
+## the covariate
+
+Next, we create the **covariate, which is a subject-level variable**, i.e. each subject has a different value here. There will be two versions of it, based on differing assumptions as to how the covariate is conceptualized:
+
+  1) Assume that the covariate itself is independent of the grouping, i.e. all groups have approximately the same average value here. If this covariate is, for example, SES, then we assume the scale it is measured with is group-specific (e.g. a country-specific SES scale).
+  
+  2) Assume that the covariate is grouping-dependent, i.e. groups have different means. For example, SES might be measured on a global scale.
+
+As a result of this, we find that the mean covariate values per group are approximately identical (figure \ref{fig:covariatemeans} top left) in the first case, and more spread out in the scond case (figure \ref{fig:covariatemeans} top right).
+
+Regardless of this, further down when we generate the response, we make sure that the effect (=slope) of the covariate on the predictor can differ between groups. 
+
+```{r, fig.width=7.7, fig.height=8, out.width="50%", fig.cap = "Spread of covariate means per group (top row). Relationship between covariates and covariate means (bottom row). Note that the bottom row displays feature spatially equal axes. \\label{fig:covariatemeans}"}
+set.seed(123)
+# grouping-independent
+xdata$covA <- rnorm(nrow(xdata))
+# grouping-specific
+xdata$covB <- xdata$covA + rnorm(ngroups, mean = 0, sd = 1)[xdata$group]
+
+# visually compare spread of mean values per grouping
+par(mfrow = c(2, 2), las = 1, family = "serif")
+hist(tapply(xdata$covA, xdata$group, mean), main = "", xlab = "grouping-independent covariate")
+hist(tapply(xdata$covB, xdata$group, mean), main = "", xlab = "grouping-specific covariate")
+plot(xdata$covA, xdata$covB, pch = 16, col = grey(0.2, 0.2), cex = 0.3, asp = 1, 
+     xlab = "grouping-independent covariate", ylab = "grouping-specific covariate")
+plot(tapply(xdata$covA, xdata$group, mean), tapply(xdata$covB, xdata$group, mean), 
+     pch = 16, col = grey(0.2, 0.2), asp = 1, 
+     xlab = "grouping-independent covariate (group means)", 
+     ylab = "grouping-specific covariate (group means)")
+```
+
+## the predictor variable
+
+Next, we create the actual **predictor variable, which is also a subject-level variable**. We call this *`latent1`* because later on we want to simulate likert scale items that aim at recovering these latent (yet unknown) variables. For example, this variable could represent something like 'parental investment' or 'time spent talking'. The main point here is that the values of this variable depend on the covariate, and in grouping-specific ways, i.e. is we need group-level intercepts and group-level slopes. Since we created two versions of the covariate above, we also need two versions of the predictor here.
+
+```{r}
+# add the intercepts and slopes to the data frame
+xdata$covint <- rnorm(ngroups, mean = 0, sd = covgroupint)[xdata$group]
+xdata$covslo <- rnorm(ngroups, mean = 0, sd = covgroupslo)[xdata$group]
+
+xdata$latent1A <- covint + xdata$covint +          # intercept
+  (xdata$covslo + covslo) * xdata$covA +           # slope
+  rnorm(nrow(xdata), mean = 0, sd = coverror)      # 'error'
+
+xdata$latent1B <- covint + xdata$covint +          # intercept
+  (xdata$covslo + covslo) * xdata$covB +           # slope
+  rnorm(nrow(xdata), mean = 0, sd = coverror)      # 'error'
+```
+
+So? Did this work? To check we fit two models that aim at recovering the parameters we set up above. We need two models because we have two pairs of covariate-predictor. Both models work on subject-level data directly with `group` as higher level factor ('random effect'). 
+
+```{r}
+# with global (grouping-independent) covariate
+res0A <- lmer(latent1A ~ covA + (covA||group), data = xdata, REML = FALSE)
+fixef(res0A)
+VarCorr(res0A)
+# summarize
+x <- data.frame(eff = c("global intercept", "global slope", 
+                        "group-level intercept", "group-level slope", "group-level error"), 
+           observed = round(c(fixef(res0A), data.frame(VarCorr(res0A))[, 5]), 2), 
+           true = c(covint, covslo, covgroupint, covgroupslo, coverror))
+
+# with language-specific covariate
+res0B <- lmer(latent1B ~ covB + (covB||group), data = xdata, REML = FALSE)
+fixef(res0B)
+VarCorr(res0B)
+# summarize
+y <- data.frame(eff = c("global intercept", "global slope", 
+                        "group-level intercept", "group-level slope", "group-level error"), 
+           observed = round(c(fixef(res0B), data.frame(VarCorr(res0B))[, 5]), 2), 
+           true = c(covint, covslo, covgroupint, covgroupslo, coverror))
+
+knitr::kable(cbind(x, y))
+```
+
+This looks good, i.e. both models seem to recover the parameters we set up quite faithfully (although sometimes the intercepts are a bit off). Let's create a visualization of this for a few example groups (figure \ref{fig:model1}).
+
+```{r, fig.width=9, fig.height=5, out.width= "60%", fig.cap = "Relationship between covariate and predictor for five example groups. In the left panel the groups have approximately the same mean in the covariate. In the right panel, groups have different covariate means. The means for covariate and predictor are indicated along the axes by the coloured ticks. \\label{fig:model1}"}
+exgroups <- sample(1:ngroups, 5)
+xcols <- brewer.pal(n = length(exgroups), name = "Dark2")
+
+par(mfrow = c(1, 2), las = 1, family = "serif")
+plot(0, 0, type = "n", xlim = range(xdata$covA), ylim = range(xdata$latent1A),
+     xlab = "covariate", ylab = "predictor")
+for(i in 1:length(exgroups)) {
+  pdata <- xdata$covA[xdata$group == exgroups[i]]
+  points(pdata, xdata$latent1A[xdata$group == exgroups[i]], pch = 16, 
+         col = adjustcolor(xcols[i], 0.5), cex = 0.5)
+  axis(1, at = mean(pdata), tcl = 0.5, lwd = 2, col = xcols[i], labels = NA)
+  axis(2, at = mean(xdata$latent1A[xdata$group == exgroups[i]]), tcl = 0.5, lwd = 2, col = xcols[i], labels = NA)
+  pdata <- data.frame(covA = range(pdata), group = exgroups[i])
+  pdata$fit <- predict(res0A, newdata = pdata)
+  points(pdata$covA, pdata$fit, type = "l", col = xcols[i], lwd = 2)
+}
+
+plot(0, 0, type = "n", xlim = range(xdata$covB), ylim = range(xdata$latent1B),
+     xlab = "covariate", ylab = "predictor")
+for(i in 1:length(exgroups)) {
+  pdata <- xdata$covB[xdata$group == exgroups[i]]
+  points(pdata, xdata$latent1B[xdata$group == exgroups[i]], pch = 16, 
+         col = adjustcolor(xcols[i], 0.5), cex = 0.5)
+  axis(1, at = mean(pdata), tcl = 0.5, lwd = 2, col = xcols[i], labels = NA)
+  axis(2, at = mean(xdata$latent1B[xdata$group == exgroups[i]]), tcl = 0.5, lwd = 2, col = xcols[i], labels = NA)
+  pdata <- data.frame(covB = range(pdata), group = exgroups[i])
+  pdata$fit <- predict(res0B, newdata = pdata)
+  points(pdata$covB, pdata$fit, type = "l", col = xcols[i], lwd = 2)
+}
+```
+
+
+
+## the overall response variable
+
+Next, we generate the response variable. Given the constraints of the eventual design of our study, we need to make sure that the value of the response is identical for each group, i.e. **the response is a group-level variable**. From a process-perspective, we assume that the value of the response for a given group depends on the mean value of the predictor of that group. Since we have two different predictors we also need to create two different versions of the response.
+
+We start again by setting up the parameters for the eventual model. As above, the first two parameters can be negative and we use actual negative values for the example here to illustrate that point.
+
+```{r}
+lat1slope <- -1.7
+globint <- -3
+globerror <- 2
+```
+
+Generate the response for the grouping-independent predictor
+
+```{r}
+xdata$predmeansA <- tapply(X = xdata$latent1A, INDEX = xdata$group, FUN = mean)[xdata$group]
+xdata$errorA <- rnorm(ngroups, mean = 0, sd = globerror)[xdata$group]
+
+xdata$respA <- globint +
+  lat1slope * xdata$predmeansA +
+  xdata$errorA
+```
+
+and for the grouping-specific predictor:
+
+```{r}
+xdata$predmeansB <- tapply(X = xdata$latent1B, INDEX = xdata$group, FUN = mean)[xdata$group]
+xdata$errorB <- rnorm(ngroups, mean = 0, sd = globerror)[xdata$group]
+
+xdata$respB <- globint +
+  lat1slope * xdata$predmeansB +
+  xdata$errorB
+```
+
+One question that still bothers me at this stage here is whether the response should also depend on the (mean) covariate. I initially thought so, but then looked again at our starting point, i.e. the hierarchical process, and there the response only depends on the predictor (and only indirectly on the covariate via the predictor/covariate relationship).
+
+
+## creating a group-level data set
+
+Finally, we need to create the data set that contains one case/row per group-level (e.g. per country). Again, we need to create two versions. As the predictor, we use the mean value in the `latent1` variable per group-level. 
+
+In addition, we add the estimated random intercepts for the grouping factor (from the predictor ~ covariate models).
+
+```{r}
+tdataA <- aggregate(list(lat1 = xdata$latent1A, resp = xdata$respA), by = list(group = xdata$group), mean)
+tdataA$lat1RE <- ranef(res0A)$group[, 1] + fixef(res0A)[1]
+
+tdataB <- aggregate(list(lat1 = xdata$latent1B, resp = xdata$respB), by = list(group = xdata$group), mean)
+tdataB$lat1RE <- ranef(res0B)$group[, 1] + fixef(res0B)[1]
+```
+
+And just for completeness sake, let's look at how the two pairs of predictor variables correlate (figure \ref{fig:pairwise}).
+
+```{r, fig.width=8, fig.height=6, out.width="60%", fig.cap = "Pair-wise scatter plots. \\label{fig:pairwise}"}
+pairs(cbind(tdataA[, c("lat1", "lat1RE")], tdataB[, c("lat1", "lat1RE")]), las = 1, lower.panel = NULL,
+      labels = c("group-independent\nmeans", "group-independent\nRE", "group-specific\nmeans", "group-specific\nRE"))
+```
+
+
+
+
+## setting up the final model
+
+So the final model predicts the response (a group-level variable) based on either the mean predictor per group, or based on the random intercepts for the predictor given the predictor ~ covariate model. Note that these models are 'simple' linear regressions.
+
+We do that again for the two versions of the predictor.
+
+```{r}
+res1Aa <- lm(resp ~ lat1, data = tdataA)    # mean values
+res1Ab <- lm(resp ~ lat1RE, data = tdataA)  # group-level intercepts
+```
+
+```{r}
+res1Ba <- lm(resp ~ lat1, data = tdataB)    # mean values
+res1Bb <- lm(resp ~ lat1RE, data = tdataB)  # group-level intercepts
+```
+
+To summarize, we compare the parameters from these models with the ones we set up above.
+
+```{r}
+x <- data.frame(what = c("intercept", "slope", "error"),
+                true = c(globint, lat1slope, globerror),
+                res1Aa = round(c(as.numeric(coef(res1Aa)), sigma(res1Aa)), 2),
+                res1Ab = round(c(as.numeric(coef(res1Ab)), sigma(res1Ab)), 2),
+                res1Ba = round(c(as.numeric(coef(res1Ba)), sigma(res1Ba)), 2),
+                res1Bb = round(c(as.numeric(coef(res1Bb)), sigma(res1Bb)), 2))
+kable(x)
+```
+
+
+So here we have kind of a two-by-two design, which is going to be reflected in the results of the simulation below.
+
+
+
+
+
+
+## simulate that multiple times
+
+Now we repeat these step a large number of times to see how the four final models fare across a range of input values. For this, we wrap all the above steps in a single function (`simfoo()`) that takes the parameter we want to recover as argument (i.e. the slope of the predictor). As output, we return the observed global slope parameter. I hide the actual function in the compiled document, but it's essentially all of the above code (except the figure generating parts). If you are interested, look it up in the .Rmd source document.
+
+
+```{r, eval = FALSE}
+simfoo <- function(lat1slope) {
+  # assign random values to the parameters
+  ngroups = sample(50:100, 1)
+  nsubj = sample(10:200, 1)
+  # for the covariate -> predictor step
+  covint = runif(1, -2, 2)
+  covslo = runif(1, -2, 2)
+  covgroupint = runif(1, 0.2, 5)
+  covgroupslo = runif(1, 0.2, 2)
+  coverror = runif(1, 0.2, 3)
+  # for predictor -> response step
+  globerror = runif(1, 0.2, 3)
+  globint = runif(1, -2, 2)
+  
+  # repeat all the steps above...
+}
+```
+
+
+There is actually only one parameter that can be varied though, which is the global slope parameter. All the other parameters are randomly assigned in the simulation function (see the above pseudo function for the the parameter ranges). For now, I run the simulation twice, once with a slope of 1.3 and once with a slope of -0.6 (see figures \ref{fig:simures13} and \ref{fig:simures06}).
+
+```{r, echo=FALSE}
+simfoo <- function(lat1slope) {
+  # assign random values to the parameters
+  ngroups = sample(50:100, 1)
+  nsubj = sample(10:200, 1)
+  # for the covariate -> predictor step
+  covint = runif(1, -2, 2)
+  covslo = runif(1, -2, 2)
+  covgroupint = runif(1, 0.2, 5)
+  covgroupslo = runif(1, 0.2, 2)
+  coverror = runif(1, 0.2, 3)
+  # for predictor -> response step
+  globerror = runif(1, 0.2, 3)
+  globint = runif(1, -2, 2)
+  
+  xdata <- expand.grid(subj = 1:nsubj, group = 1:ngroups)
+  xdata$covA <- rnorm(nrow(xdata))
+  xdata$covB <- xdata$covA + rnorm(ngroups, mean = 0, sd = 1)[xdata$group]
+  xdata$covint <- rnorm(ngroups, mean = 0, sd = covgroupint)[xdata$group]
+  xdata$covslo <- rnorm(ngroups, mean = 0, sd = covgroupslo)[xdata$group]
+  
+  xdata$latent1A <- covint + xdata$covint +          # intercept
+    (xdata$covslo + covslo) * xdata$covA +           # slope
+    rnorm(nrow(xdata), mean = 0, sd = coverror)      # 'error'
+  
+  xdata$latent1B <- covint + xdata$covint +          # intercept
+    (xdata$covslo + covslo) * xdata$covB +           # slope
+    rnorm(nrow(xdata), mean = 0, sd = coverror)      # 'error'
+  
+  res0A <- lmer(latent1A ~ covA + (covA||group), data = xdata, REML = FALSE)
+  res0B <- lmer(latent1B ~ covB + (covB||group), data = xdata, REML = FALSE)
+  
+  xdata$predmeansA <- tapply(X = xdata$latent1A, INDEX = xdata$group, FUN = mean)[xdata$group]
+  xdata$errorA <- rnorm(ngroups, mean = 0, sd = globerror)[xdata$group]
+  xdata$respA <- globint +
+    lat1slope * xdata$predmeansA +
+    xdata$errorA
+  
+  xdata$predmeansB <- tapply(X = xdata$latent1B, INDEX = xdata$group, FUN = mean)[xdata$group]
+  xdata$errorB <- rnorm(ngroups, mean = 0, sd = globerror)[xdata$group]
+  xdata$respB <- globint +
+    lat1slope * xdata$predmeansB +
+    xdata$errorB
+  
+  tdataA <- aggregate(list(lat1 = xdata$latent1A, resp = xdata$respA), by = list(group = xdata$group), mean)
+  tdataA$lat1RE <- ranef(res0A)$group[, 1] + fixef(res0A)[1]
+
+  tdataB <- aggregate(list(lat1 = xdata$latent1B, resp = xdata$respB), by = list(group = xdata$group), mean)
+  tdataB$lat1RE <- ranef(res0B)$group[, 1] + fixef(res0B)[1]
+  
+  res1Aa <- lm(resp ~ lat1, data = tdataA)    # mean values
+  res1Ab <- lm(resp ~ lat1RE, data = tdataA)  # group-level intercepts
+  res1Ba <- lm(resp ~ lat1, data = tdataB)    # mean values
+  res1Bb <- lm(resp ~ lat1RE, data = tdataB)  # group-level intercepts
+  
+  res <- c(ngroups, nsubj, lat1slope, 
+         coef(res1Aa)[2], 
+         coef(res1Ab)[2], 
+         coef(res1Ba)[2], 
+         coef(res1Bb)[2])
+
+  return(res)
+}
+```
+
+
+```{r runsimu, warning=FALSE, message=FALSE, cache=TRUE}
+nsim <- 201
+res1 <- matrix(ncol = 7, nrow = nsim)
+res2 <- matrix(ncol = 7, nrow = nsim)
+colnames(res1) <- c("ngroups", "nsubj", "slope", "res1Aa", "res1Ab", "res1Ba", "res1Bb")
+colnames(res2) <- c("ngroups", "nsubj", "slope", "res1Aa", "res1Ab", "res1Ba", "res1Bb")
+
+pb <- progress_estimated(n = nsim)
+
+for(i in 1:nsim) {
+  tryCatch({res1[i, ] <- simfoo(lat1slope = 1.3)}, warning = function(e) e)
+  tryCatch({res2[i, ] <- simfoo(lat1slope = -0.6)}, warning = function(e) e)
+  update_progress(pb)
+}
+
+res1 <- na.omit(res1)
+res2 <- na.omit(res2)
+```
+
+Note that during the simulation, a number of runs will likely produce warnings and/or messages. The simulation is set up in a way that models resulting in warnings will be excluded (affecting `r round((1-(nrow(res1) + nrow(res2))/(nsim * 2))*100, 1)`% of simulation runs). The models resulting in messages (typically indicating singular fits) are not excluded for now. I suspect that these cases are responsible for some of the extreme slope estimates that occur in some of the simulation runs.
+
+To summarize the results graphically, I wrote a function, which can be seen in the source document. Essentially, it produces four histograms of the observed slope parameters. 
+
+```{r plotfuncs, echo = FALSE}
+histfoo <- function(x, cent, width = 3, step = 0.2, ...) {
+  ex <- NULL
+  if(sum(abs(x) > 100) > 0) {
+    ex <- sum(abs(x) > 100)
+    x <- x[abs(x) <= 100]
+  }
+  br <- seq(floor(min(x)) - step/2, ceiling(max(x)) + step/2, by = step)
+  h <- hist(x, xlim = c(cent - width, cent + width), breaks = br, xaxs = "i", yaxs = "i", 
+            col = "grey80", border = "grey50", ...)
+  box(bty = "l")
+  if(sum(x < cent - width) > 0) {
+    arrows(x0 = cent - width + 1, y0 = 0, x1 = cent - width, y1 = 0, col = "red", xpd = TRUE, length = 0.1, lwd = 2)
+    text(x = cent - width + 0.25, y = max(h$counts)*(-0.03), labels = sum(x < cent - width), adj = c(0.5, 1), 
+         xpd = TRUE, col = "red", cex = 0.7)
+  }
+  if(sum(x > cent + width) > 0) {
+    arrows(x0 = cent + width - 1, y0 = 0, x1 = cent + width, y1 = 0, col = "red", xpd = TRUE, length = 0.1, lwd = 2)
+    text(x = cent + width - 0.75, y = max(h$counts)*(-0.03), labels = sum(x > cent + width), adj = c(0.5, 1), 
+         xpd = TRUE, col = "red", cex = 0.7)
+  }
+  abline(v = cent, col = "red", lwd = 3)
+  abline(v = mean(x), col = "blue", lwd = 3, lty = 3)
+  if(!is.null(ex)) legend("topright", legend = paste(ex, "extreme value(s) excluded"), cex = 0.5, bty = "n")
+}
+
+plotres <- function(simres, cent, ...) {
+  par(mfrow = c(2, 2), las = 1, family = "serif")
+  histfoo(x = simres[, "res1Aa"], cent = cent, main = "res1Aa", ...)
+  histfoo(x = simres[, "res1Ab"], cent = cent, main = "res1Ab", ...)
+  histfoo(x = simres[, "res1Ba"], cent = cent, main = "res1Ba", ...)
+  histfoo(x = simres[, "res1Bb"], cent = cent, main = "res1Bb", ...)
+}
+```
+
+So here are the graphical results of this simulation. Remember: the two models `res1Aa` and `res1Ab` are based on the assumption that the covariate has the same mean in all groups. The two models `res1Ba` and `res1Bb` are based on the assumption that the covariate mean differs between groups. Models `res1Aa` and `res1Ba` use simply the mean values per group for the predictor, whereas `res1Ab` and `res1Bb` use the random effect intercepts of the predictor~covariate models.
+
+
+```{r, fig.width=9, fig.height=5.5, out.width="65%", fig.cap = "Graphical results for slope = 1.3. Any red arrows along the horizontal axes indicate values that lay outside the axis range. In addition, any `extreme' values (absolute value larger than 100) are excluded, and if they exist are indicated by a text box in the figure. The vertical red line indicates the target value (here 1.3) and the vertical dashed blue line is the mean value over all slopes (excluding any extreme values). \\label{fig:simures13}"}
+plotres(res1, cent = 1.3, step = 0.1, width = 2)
+```
+
+```{r, fig.width=9, fig.height=5.5, out.width="65%", fig.cap = "Graphical results for slope = -0.6. The vertical red line indicates the target value (here -0.6). See the previous figure for more explanations. \\label{fig:simures06}"}
+plotres(res2, cent = -0.6, step = 0.1, width = 2)
+```
+
+
+
+
+
