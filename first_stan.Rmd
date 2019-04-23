@@ -98,7 +98,7 @@ fit1b <- sampling(mod1b, data = xd, iter = 5000)
 print(fit1b)
 ```
 
-So this behaved as promised, i.e. the intercept point estimate for the intercept is positive (just quite).
+So this behaved as promised, i.e. the point estimate for the intercept is positive (just quite).
 
 # multiple linear regression with interaction
 
@@ -117,7 +117,7 @@ plot(xdata$x1 * xdata$x2, xdata$resp)
 xd <- list(N = nrow(xdata), x1 = xdata$x1, x2 = xdata$x2, resp = xdata$resp)
 ```
 
-Interactions need to be coded 'manually', i.e. the interaction term has to be created in the `transformed data` block. For multiplication, it apparently is necessary to use "`.*`".
+Interactions need to be coded 'manually', i.e. the interaction term has to be created in the `transformed data` block. For multiplication, it apparently is necessary to use '`.*`'.
 
 ```{r stanmod2, engine='stan', output.var="mod2", cache=TRUE}
 data {
@@ -165,5 +165,25 @@ stan_dens(fit2, "slope12")
 mcmc_areas(x = as.matrix(fit2), pars = "slope12", prob = 0.5)
 ```
 
+# hierarchical?
+
+
+```{r}
+# group level response, subject level predictor
+n1 = 200
+n2 = 15
+xdata <- data.frame(x1 = rnorm(n1), group = sample(1:n2, n1, replace = TRUE))
+
+xdata$groupintercept <- rnorm(n1)[xdata$group]
+xdata$groupslope <- rnorm(n1)[xdata$group]
+
+xdata$resp <- 2 + xdata$groupintercept +
+  (1.5 + xdata$groupslope) * xdata$x1 +
+  rnorm(n1)
+
+xdata$resp2 <- tapply(xdata$resp, xdata$group, mean)[xdata$group]
+res <- lmer(resp ~ x1 + (x1||group), data = xdata, REML = FALSE)
+summary(res)
+```
 
 
