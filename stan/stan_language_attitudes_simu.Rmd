@@ -1,0 +1,90 @@
+---
+title: "simulating language attitudes"
+author: "Christof Neumann"
+date: "1/3/2020"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+def.chunk.hook  <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- def.chunk.hook(x, options)
+  ifelse(options$size != "normalsize", paste0("\\", options$size,"\n\n", x, "\n\n \\normalsize"), x)
+})
+knitr::opts_chunk$set(size = 'footnotesize', fig.align = 'center', echo = TRUE)
+options(width = 118)
+# cach path (outside of dropbox please...)
+cpath <- normalizePath("~/Box/_rcache/stan_language_attitudes_simu/")
+knitr::opts_chunk$set(cache.path = paste0(cpath, "/"))
+```
+
+The idea is here to simulate a process that is truly hierarchical. To this end we will set up a process that ends in the generation of a response (*`resp`*). This response depends on a predictor, which in turn depends on a covariate. The tricky thing is that sample sizes accross the different layers vary. For example, we have individual data (for instance from a survey) for people from different countries. But the response variable is a feature of the country. In other words our 'final' sample size is the number of countries we have and not the number of individual respondants (which is substantially larger). Traditionally, we would just average over all the people within a country, but this approach would ignore the variation within countries as well as the certainty of the 'average' value per country (imagine countries with only a dozen of respondants versus a country with thousands of respondants).
+
+First we need a data generation function. The way I wrote this function is pretty verbose and it surely could be streamlined and become more efficient.
+
+
+```{r}
+n_groups = 10
+n_per_group = 200
+min_per_group = 10
+indlevel <- list(p1 = list(intercept = 2, intsd = 1.2, 
+                           slope1 = -1, slosd1 = 0.4, 
+                           error = 1.7))
+
+datagen <- function(n_groups = 10, n_per_group = 1000, min_per_group = 10) {
+  # generate group sizes
+  n_ind <- round(rnorm(n = n_groups, mean = n_per_group, sd = n_per_group / 2))
+  if (min(n_ind) < 0) n_ind <- n_ind + abs(min(n_ind))
+  n_ind <- n_ind - min(n_ind) + min_per_group
+  
+  # create results backbone
+  res <- data.frame(id = 1:sum(n_ind), group = rep(1:n_groups, n_ind))
+  res$resp1 <- NA
+  res$pred1 <- NA
+  # now generate data for each group
+  i=1
+  for (i in 1:n_groups) {
+    # create random predictor
+    pred1 <- rnorm(n = n_ind[i])
+    # create response
+    resp <- rnorm(n = 1, mean = indlevel$p1$intercept, sd = indlevel$p1$intsd) +
+      rnorm(n = 1, mean = indlevel$p1$slope1, sd = indlevel$p1$slosd1) * pred1 +
+      rnorm(n = n_ind[i], mean = 0, sd = indlevel$p1$error)
+    # add to results
+    xlines <- which(res$group == i)
+    res$resp1[xlines] <- resp
+    res$pred1[xlines] <- pred1
+    # clean up
+    rm(xlines, pred1, resp)
+  }
+  
+  # now generate the high level relationship
+  # take the average response as the new predictor
+  # ideally we would also integrate the measure about uncertainty here:
+  # the predictor value for small groups is less certain
+  pred <- as.numeric(scale(tapply(res$resp1, res$group, mean)))
+  # add some noise according to sample size
+  pred_noisy <- pred + rnorm(n = n_ind, mean = 0, sd = pnorm(scale(n_ind) * (-1)))
+  # plot(scale(n_ind), pnorm(scale(n_ind) * (-1)))
+  
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

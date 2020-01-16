@@ -1,0 +1,413 @@
+---
+title: "meta_regression"
+author: "Christof Neumann"
+date: "12/26/2019"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(knitr)
+cpath <- normalizePath("~/Box/_rcache/meta_regression_part1/")
+knitr::opts_chunk$set(cache.path = paste0(cpath, "/"))
+```
+
+
+```{r, message = FALSE}
+library(rstan)
+library(lme4)
+library(brms)
+library(rstanarm)
+# set a global parameter for sampling in stan
+# 0 turns all messages off
+# 1000 updates after 1000 iterations and per chain
+refresh <- 500 
+```
+
+Note to myself regarding peculiarities of using stan in markdown with caching: in order for the model objects to be correctly cached check that access to the Box drive works. Also, make sure that chunks are properly named. And there are at least two routes to fit the models using cache: via stan code -> `stan_model()` -> `sampling()`, or more directly (combining compilation and sampling) via stan code -> `stan`. The former has the advantage that if the data change we only have to redo the sampling. But the problem is that when the data changes than if both steps are cached, the compiled version will present the results from previous data.
+
+```{r}
+# set to FALSE if you want to make sure that sampling is done freshly 
+use_sample_cache <- TRUE
+```
+
+
+# Background
+
+The major purpose of this document is to serve as 'course notes' for myself about learning to code models in `stan`. I'll try to implement increasinlgy more complex models with an ultimate goal in mind, which I think requires a fair bit of complexity in the `stan` code.
+
+The general idea I have in mind is to run a 'meta analysis' in which we want to investigate the consequences of model specification (include subject-level slopes or not). The source data are multiple existing data sets (scraped from data repositories) each representing a published study (with animal behaviour as the broad subject field). In the simplest case, we might want to know how the parameter estimate of a within-subject variable shifts depending on the specification of the within-subject variance in intercepts and slopes. For example, it could be that parameters are overestimated if we ignore subject-level variance in slopes. This is important because it is my impression that within-subject variance beyond intercepts is often ignored.
+
+Since this is tricky business, at least for me and especially in the context of using `stan`, I shall start fairly simple. Let's say there is a global quantity of interest, which we don't know. Or actually, let's say there are two of those. These are the ones we want to learn from our data. I call these `goal1` and `goal2`. These are essentially just two numbers.
+
+```{r}
+# global quantities of interest
+goal1 <- 25.3
+goal2 <- 5.1
+```
+
+Next we need to decide how many data sets we generate and how many cases there are per data set. Ultimately, these will be the studies we integrate for the meta analysis and the 'goals' in this context could be effect sizes of differently specified models on the same study data set.
+
+```{r}
+# for reproducibility
+set.seed(123)
+# number of studies
+n_studies <- 20
+# number of cases per study (mirroring at least 6 subjects with at least 3 observations per id)
+n_per_study <- round((1:n_studies)*6*3*runif(n = n_studies, 1, 2))
+```
+
+Now we need to generate data that conform to these settings. Keeping it simple here means that we just generate normally distributed numbers. The numbers for each study have a mean, which itself also comes from a normal distribution where `goal1` is the mean and `goal2` is the SD. The SDs *within* each study don't concern us much, so we just use positive random numbers (from a gamma distribution).
+
+```{r}
+study_means <- rnorm(n = n_studies, mean = goal1, sd = goal2)
+(goal1_sample <- mean(study_means)) # might be a little off of true goal
+(goal2_sample <- sd(study_means)) # might be a little off of true goal
+
+# SD for each study
+study_sds <- rgamma(n = n_studies, shape = 6, rate = 3)
+```
+
+Note that the actual two values will slightly (more or less) differ from our true goals. But we can fix them to the true values if we want. I commented this code, so I didn't execute it.
+
+```{r, echo=TRUE, eval=TRUE}
+# fix it exactly at goals
+# study_means <- goal1 + goal2 * as.numeric(scale(study_means))
+# (goal1_sample <- mean(study_means)) # exact goal
+# (goal2_sample <- sd(study_means)) # exact goal
+```
+
+Now we can create the actual study data.
+
+```{r}
+templatedata <- data.frame(n_per_study, study_means, study_sds)
+
+xdata <- list()
+for(i in 1:n_studies) {
+  xdata[[i]] <- data.frame(resp = rnorm(n = templatedata$n_per_study[i], 
+                                        mean = templatedata$study_means[i], 
+                                        sd = templatedata$study_sds[i]))
+}
+```
+
+Now we have the data and the next step is to prepare/modify this for `stan`, which requires a list with only numeric input.
+
+```{r}
+tdata <- list()
+# total number of studies
+tdata$n_studies <- length(xdata)
+# the response values in all data sets combined as a vector
+tdata$respvals <- unlist(lapply(xdata, function(X)X[, 1]))
+# numeric indicator of study ID (number of studies/data sets) for each observation
+studyid <- rep(1:length(xdata), unlist(lapply(xdata, nrow)))
+# total number of observations
+tdata$total_n <- length(tdata$respvals)
+# location matrix: which response value corresponds to which study
+tdata$locmat <- matrix(ncol = n_studies, nrow = tdata$total_n, 0)
+for (i in 1:length(xdata)) tdata$locmat[studyid == i, i] <- 1
+# n of observation per study
+tdata$n_per_study <- colSums(tdata$locmat)
+
+lapply(tdata, head, 3)
+```
+
+
+The next step is to write the `stan` code and fit the model in `stan`. In the first step, I restrict myself to estimate the means and SDs of each study. We don't really care about the SDs within the studies, but we can use them to check how the model performed. In contrast, the means of each study will become relevant later on when we need them to estimate to mean of the means (= goal 1).
+
+```{r stan1, message = FALSE, cache=TRUE}
+stancode1 <- "
+data {
+  int<lower=1> n_studies;
+  int<lower=1> total_n;
+  vector[total_n] respvals;
+  matrix[total_n, n_studies] locmat;
+  int n_per_study[n_studies];
+}
+parameters {
+  vector<lower=0>[n_studies] study_sigma; // the SD per study
+  vector[n_studies] study_mean; // the mean per study
+}
+model {
+  for (n in 1:n_studies) {
+    // create a temporary response vector (depending on the n in the given study)
+    vector[n_per_study[n]] response;
+    int pos;
+    pos = 1;
+    // fill with the actual data values (i.e. the raw data for a given study)
+    for (i in 1:rows(locmat)) {
+      if (locmat[i, n]) {
+        response[pos] = respvals[i];
+        pos = pos + 1;
+      }
+    }
+    // fit the same 'model' to each data set
+    // actually, this only estimates the mean and sd of the response in each study
+    study_sigma[n] ~ cauchy(1, 5);
+    study_mean[n] ~ normal(0, 50);
+    response ~ normal(study_mean[n], study_sigma[n]);
+  }
+}
+"
+stan_mod1 <- stan_model(model_code = stancode1)
+```
+
+```{r stan1_sample1, cache=use_sample_cache}
+fit1 <- sampling(object = stan_mod1, data = tdata, 
+                 iter = 2000, chains = 4, cores = 4, refresh = refresh)
+```
+
+```{r echo=FALSE, eval=FALSE}
+# load from cache
+cfp::cacheload("stan1")
+cfp::cacheload("stan1_sample1")
+```
+
+I'll skip diagnostics for this document and just look at the results. Specifically, we visually compare the means of the posteriors for all the means and all the SDs between the model and the input data we generated.
+
+```{r, fig.width=7, fig.height=3.2, fig.cap="Comparison between input parameters and recovered parameters. In the right panel, the sub-data sets with smallest sample sizes are highlighted."}
+par(mfrow = c(1, 2), las = 1, family = "serif")
+
+moddata <- colMeans(extract(fit1)$study_mean)
+inputdata <- templatedata$study_mean
+plot(inputdata, moddata, asp = 1,
+     main = "mean for each study", xlab = "template", ylab = "modelled")
+abline(0, 1, lty = 2)
+
+moddata <- colMeans(extract(fit1)$study_sigma)
+inputdata <- templatedata$study_sd
+plot(inputdata, moddata, asp = 1,
+     main = "SD for each study", xlab = "template", ylab = "modelled")
+abline(0, 1, lty = 2)
+# and highlight ones with the smallest sample sizes 
+# (which happen to be the first three studies)
+points(inputdata[1:3], moddata[1:3], pch = 16, col = c("red", "orange", "yellow"))
+```
+
+This looks pretty good to me, especially for the means. The results for the SDs are a bit less satisfying, although it seems that the largets deviations relate to small sample sizes within studies.
+
+Now we add the second layer, i.e. we use the means and SDs of each study to estimate the global mean (`goal1`) and global SD (`goal2`).
+
+```{r stan2, message = FALSE, cache=TRUE}
+stancode2 <- "
+data {
+  int<lower=0> n_studies;
+  int<lower=0> total_n;
+  vector[total_n] respvals;
+  matrix[total_n, n_studies] locmat;
+  int n_per_study[n_studies];
+}
+parameters {
+  vector<lower=0>[n_studies] study_sigma; // the SD per study
+  vector[n_studies] study_mean; // the mean per study
+  real goal1;
+  real<lower=0> goal2;
+}
+model {
+  for (n in 1:n_studies) {
+    // create a temporary response (depending on the n in the given study)
+    vector[n_per_study[n]] response;
+    int pos;
+    pos = 1;
+    // fill with the actual data values (i.e. the raw data for a given study)
+    for (i in 1:rows(locmat)) {
+      if (locmat[i, n]) {
+        response[pos] = respvals[i];
+        pos = pos + 1;
+      }
+    }
+    // the model for the means
+    // might be possible to move this to a generated quantities block?
+    study_sigma[n] ~ cauchy(1, 5);
+    study_mean[n] ~ normal(0, 50);
+    response ~ normal(study_mean[n], study_sigma[n]);
+  }
+  goal1 ~ normal(0, 50);
+  goal2 ~ cauchy(1, 5);
+  study_mean ~ normal(goal1, goal2);
+}
+"
+
+stan_mod2 <- stan_model(model_code = stancode2)
+```
+
+```{r stan2_sample1, cache=use_sample_cache}
+fit2 <- sampling(object = stan_mod2, data = tdata, 
+                 iter = 4000, chains = 4, cores = 4, refresh = refresh)
+```
+
+```{r echo=FALSE, eval=FALSE}
+# load from cache
+cfp::cacheload("stan2")
+cfp::cacheload("stan2_sample1")
+```
+
+
+The following is just a function I wrote to display posterior distributions. It's in base plot (as opposed to `rstan`s `stan_dens()`), which I know way better than `ggplot` and hence allows simple adding of elements after the initial plot is drawn. NB: the display of the prior is potentially misleading, because its vertical scale is most likely fairly off relatively speaking (although the shape along the horizontal axis is correct). 
+
+```{r my dens, eval = TRUE}
+my_dens <- function(x, span = 0.1, resol = 200, addraw = FALSE, prior = NULL, ...) {
+  xcol <- hcl.colors(2, palette = "Zissou 1")[1]
+  temp <- hist(x, breaks = seq(floor(min(x)), ceiling(max(x)), length.out = resol), plot = FALSE)
+  xvals <- temp$mids
+  dens <- temp$density
+  dvals <- predict(loess(dens ~ xvals, span = span))
+  plot(0, 0, xlim = range(xvals), ylim = c(0, max(dvals)), type = "n", 
+       axes = FALSE, ylab = "", xlab = "", yaxs = "i", ...)
+  title(ylab = "density", line = 0.1)
+  axis(1, ...)
+  polygon(x = c(xvals, rev(xvals)), 
+          y = c(rep(0, length(xvals)), rev(dvals)), 
+          border = NA, col = xcol)
+  segments(floor(min(x)), 0, ceiling(max(x)), 0, xpd = TRUE)
+  segments(floor(min(x)), 0, floor(min(x)), max(dvals), xpd = TRUE)
+  if (addraw) points(xvals, dens, type = "l", col = "black", lwd = 0.5, xpd = TRUE)
+  if (!is.null(prior)) {
+    if (prior[1] == "cauchy") {
+      d <- dcauchy(seq(from = min(xvals), to = max(xvals), length.out = length(xvals)), 
+                   location = as.numeric(prior[2]), 
+                   scale = as.numeric(prior[3]))
+      points(xvals, (d / max(d)) * max(dvals), type = "l")
+    }
+    if (prior[1] == "norm") {
+      d <- dnorm(seq(from = min(xvals), to = max(xvals), length.out = length(xvals)), 
+                 mean = as.numeric(prior[2]),
+                 sd = as.numeric(prior[3]))
+      points(xvals, (d / max(d)) * max(dvals), type = "l")
+    }
+  }
+}
+```
+
+Now let's look at the poster distribution of our parameters of interest `goal1` and `goal2`.
+
+```{r, fig.width=7, fig.height=3.2, fig.cap = "Posteriors for the two global parameters. The red lines correspond to the posterior mean. The orange line is the mean of the parameters from our sample (\\texttt{goal1\\_sample} and \\texttt{goal2\\_sample}). The black line is the corresponding population parameter (\\texttt{goal1} and \\texttt{goal2}), which in both cases are likely to be a bit off. In contrast, the model (red) should recover the sample parameters (orange) pretty well. In this particular example, this is certainly true for \\texttt{goal1} but less so for \\texttt{goal2}..."}
+par(mfrow = c(1, 2), family = "serif")
+# goal 1
+my_dens(extract(fit2)$goal1, main = "goal 1", cex.axis = 0.7)
+# add the mean of the posterior
+abline(v = summary(fit2)$summary["goal1", "mean"], col = "red", lwd = 2)
+# add the actual goal value from the generated data 
+# (which may or may not be a little of the true goal value)
+abline(v = goal1_sample, col = "orange", lwd = 1, lty = 2)
+# and for the record, the initial goal value as well
+abline(v = goal1)
+
+# goal 2
+my_dens(extract(fit2)$goal2, main = "goal 2", cex.axis = 0.7)
+abline(v = summary(fit2)$summary["goal2", "mean"], col = "red", lwd = 2)
+abline(v = goal2_sample, col = "orange", lwd = 1, lty = 2)
+abline(v = goal2)
+
+# use rstan's functions if you prefer
+# stan_dens(fit2, pars = "goal1")
+# stan_dens(fit2, pars = "goal2")
+```
+
+This again looks mostly good to my eyes. Let's look the numbers now:
+
+```{r}
+# goal 1
+round(goal1_sample, 2)
+round(summary(fit2)$summary["goal1", "mean"], 2)
+
+# goal 2
+round(goal2_sample, 2)
+round(summary(fit2)$summary["goal2", "mean"], 2)
+```
+
+Hmmm. Pretty good for the global mean (`goal1`) but less so for the global SD (`goal2`). 
+
+So far this has been fairly straightforward, and we could even check how a traditional mixed model would fare. Although, using `lmer` we can only assess the predicted values for the mean of each 'study', without a direct possibility to gauge the uncertainty in these estimates. 
+
+```{r fit2_with_lme4, cache = TRUE}
+# reformat data to long data frame
+tempdata <- data.frame(resp = tdata$respvals, study_id = as.factor(studyid))
+
+# fit with lme4's lmer
+res_l <- lmer(resp ~ 1 + (1|study_id), data = tempdata)
+
+# goal 1
+round(goal1_sample, 2)
+round(as.numeric(fixef(res_l))[1], 2)
+
+# goal 2
+round(goal2_sample, 2)
+round(data.frame(VarCorr(res_l))[1, "sdcor"], 2)
+```
+
+Also, we can fit this model with `brm` and `rstanarm`.
+
+```{r fit2_with_brm, cache = TRUE}
+# reformat data to long data frame
+tempdata <- data.frame(resp = tdata$respvals, study_id = as.factor(studyid))
+
+# fit with brms's brm
+res_b <- brm(resp ~ 1 + (1|study_id), data = tempdata, family = "gaussian", iter = 4000, cores = 4)
+
+# goal 1
+round(goal1_sample, 2)
+round(fixef(res_b)["Intercept", "Estimate"], 2)
+
+# goal 2
+round(goal2_sample, 2)
+round(mean(as.data.frame(res_b$fit)$sd_study_id__Intercept), 2)
+```
+
+
+```{r echo=FALSE, eval=FALSE}
+# load from cache
+cfp::cacheload("fit2_with_brm")
+# res_b <- update(res_b, newdata = tempdata, iter = 4000, cores = 4)
+```
+
+```{r fit2_with_rstanarm, cache = TRUE}
+# reformat data to long data frame
+tempdata <- data.frame(resp = tdata$respvals, study_id = as.factor(studyid))
+
+# fit with rstanarm's stan_lmer
+res_a <- stan_lmer(resp ~ 1 + (1|study_id), data = tempdata, cores = 4, iter = 4000)
+
+# goal 1
+round(goal1_sample, 2)
+round(fixef(res_a)["(Intercept)"], 2)
+
+# goal 2
+round(goal2_sample, 2)
+round(data.frame(VarCorr(res_a))[1, "sdcor"], 2)
+```
+
+```{r echo=FALSE, eval=FALSE}
+# load from cache
+cfp::cacheload("fit2_with_rstanarm")
+# res_a <- update(res_a, data = tempdata, iter = 4000, cores = 4)
+```
+
+Let's try to summarize this section. The goal was to estimate two parameters (`goal1` = `r goal1` and `goal2` = `r goal2`), which were population parameters. Using these parameters I generated random data and the first thing to note is that in the actual data these parameters were slightly different due to sampling/randomness in the data generation: `goal1` = `r round(goal1_sample, 2)` and `goal2` = `r round(goal2_sample, 2)`.
+
+```{r, fig.width=7, fig.height=3.2, fig.cap = "Comparison of point estimates between different modelling packages. The horizontal dashed line represents the goal."}
+par(family = "serif", mfrow = c(1, 2), cex.axis = 0.7)
+# goal 1
+plot(0, 0, type = "n", xlim = c(0, 5), ylim = c(24, 25), axes = FALSE, ann = FALSE)
+axis(1, at = c(1:4), labels = c("manual\nstan", "lme4", "brm", "rstanarm"), tcl = 0)
+axis(2, las = 1)
+box()
+points(1, summary(fit2)$summary["goal1", "mean"])
+points(2, as.numeric(fixef(res_l))[1])
+points(3, fixef(res_b)["Intercept", "Estimate"])
+points(4, fixef(res_a)["(Intercept)"])
+abline(h = goal1_sample, lty = 2)
+
+# goal 2
+plot(0, 0, type = "n", xlim = c(0, 5), ylim = c(4.5, 5.5), axes = FALSE, ann = FALSE)
+axis(1, at = c(1:4), labels = c("manual\nstan", "lme4", "brm", "rstanarm"), tcl = 0)
+axis(2, las = 1)
+box()
+points(1, summary(fit2)$summary["goal2", "mean"])
+points(2, data.frame(VarCorr(res_l))[1, "sdcor"])
+points(3, mean(as.data.frame(res_b$fit)$sd_study_id__Intercept))
+points(4, data.frame(VarCorr(res_a))[1, "sdcor"])
+abline(h = goal2_sample, lty = 2)
+```
+

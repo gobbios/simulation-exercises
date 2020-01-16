@@ -1,0 +1,361 @@
+---
+title: "meta_regression"
+author: "Christof Neumann"
+date: "12/26/2019"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(knitr)
+cpath <- normalizePath("~/Box/_rcache/meta_regression_part2/")
+knitr::opts_chunk$set(cache.path = paste0(cpath, "/"))
+```
+
+```{r my dens, eval = TRUE, echo=FALSE}
+my_dens <- function(x, span = 0.1, resol = 200, addraw = FALSE, prior = NULL, ...) {
+  xcol <- hcl.colors(2, palette = "Zissou 1")[1]
+  temp <- hist(x, breaks = seq(floor(min(x)), ceiling(max(x)), length.out = resol), plot = FALSE)
+  xvals <- temp$mids
+  dens <- temp$density
+  dvals <- predict(loess(dens ~ xvals, span = span))
+  plot(0, 0, xlim = range(xvals), ylim = c(0, max(dvals)), type = "n", 
+       axes = FALSE, ylab = "", xlab = "", yaxs = "i", ...)
+  title(ylab = "density", line = 0.1)
+  axis(1, ...)
+  polygon(x = c(xvals, rev(xvals)), 
+          y = c(rep(0, length(xvals)), rev(dvals)), 
+          border = NA, col = xcol)
+  segments(floor(min(x)), 0, ceiling(max(x)), 0, xpd = TRUE)
+  segments(floor(min(x)), 0, floor(min(x)), max(dvals), xpd = TRUE)
+  if (addraw) points(xvals, dens, type = "l", col = "black", lwd = 0.5, xpd = TRUE)
+  if (!is.null(prior)) {
+    if (prior[1] == "cauchy") {
+      d <- dcauchy(seq(from = min(xvals), to = max(xvals), length.out = length(xvals)), 
+                   location = as.numeric(prior[2]), 
+                   scale = as.numeric(prior[3]))
+      points(xvals, (d / max(d)) * max(dvals), type = "l")
+    }
+    if (prior[1] == "norm") {
+      d <- dnorm(seq(from = min(xvals), to = max(xvals), length.out = length(xvals)), 
+                 mean = as.numeric(prior[2]),
+                 sd = as.numeric(prior[3]))
+      points(xvals, (d / max(d)) * max(dvals), type = "l")
+    }
+  }
+}
+```
+
+```{r, message = FALSE}
+library(rstan)
+library(lme4)
+library(brms)
+library(rstanarm)
+# set a global parameter for sampling in stan
+# 0 turns all messages off
+# 1000 updates after 1000 iterations and per chain
+refresh <- 500 
+```
+
+
+```{r}
+# set to FALSE if you want to make sure that sampling is done freshly 
+use_sample_cache <- TRUE
+```
+
+
+# running actual submodels within one `stan` model
+
+The next step is to actually simulate proper 'studies'. By this I mean that we have multiple data sets that each contain predictors and a response (and not only a single vector as above). The overall idea is the same though. We set global parameter(s) that we want to estimate, then we generate data using the selected parameter(s) and then we run the model to see whether we can recover the global parameters.
+
+The structure for the data generation is overall the same as above. The major difference is that when create the data list (`xdata`) each list item is going to be a data frame with two predictors and one response variable. One of the predictors is going to be a continuous variable the other is going to be binary (imagine a dummy coded two-level factor). The global parameters we set are the effect sizes for each.
+
+```{r}
+# for reproducibility
+set.seed(1234)
+# number of studies
+n_studies <- 20
+n_per_study <- sample((n_studies*5) : (n_studies*10), size = n_studies, replace = TRUE)
+
+# global quantities of interest
+goal1 <- 0.3 # global effect of the binary
+goal2 <- -1.2 # global effect of the continuous
+```
+
+
+Here we create the effects for each study.
+
+```{r}
+eff_bin <- rnorm(n = n_studies, mean = goal1, sd = abs(goal1/2))
+eff_con <- rnorm(n = n_studies, mean = goal2, sd = abs(goal2/2))
+(goal1_sample <- mean(eff_bin)) # might be a little off of true goal
+(goal2_sample <- mean(eff_con)) # might be a little off of true goal
+```
+
+
+Now we can create the actual study data.
+
+```{r}
+templatedata <- data.frame(n_per_study, eff_bin, eff_con)
+
+xdata <- list()
+for(i in 1:n_studies) {
+  temp <- data.frame(cont = rnorm(n = templatedata$n_per_study[i]), 
+                     bin = rbinom(n = templatedata$n_per_study[i], size = 1, prob = 0.5))
+  # create response as simple linear model
+  temp$resp <- rnorm(1, mean = 10, sd = 3) + # intercept
+    temp$cont * templatedata$eff_con[i] + # continuous
+    temp$bin * templatedata$eff_bin[i] + # binary
+    rnorm(templatedata$n_per_study[i])
+  
+  xdata[[i]] <- temp
+}
+```
+
+```{r}
+# verify
+x <- do.call("rbind", lapply(xdata, function(X) {
+  coef(lm(resp ~ cont + bin, data = X))
+  }))
+mean(x[, "cont"])
+mean(x[, "bin"])
+```
+
+Now prepare the data list for usage with `stan`.
+
+```{r}
+tdata <- list()
+# total number of studies
+tdata$n_studies <- length(xdata)
+# the three numeric variables in all data sets combined as a vector each
+tdata$respvals <- unlist(lapply(xdata, function(X)X[, "resp"]))
+tdata$cont <- unlist(lapply(xdata, function(X)X[, "cont"]))
+tdata$bin <- unlist(lapply(xdata, function(X)X[, "bin"]))
+# numeric indicator of study ID (number of studies/data sets) for each observation
+studyid <- rep(1:length(xdata), unlist(lapply(xdata, nrow)))
+# total number of observations
+tdata$total_n <- length(tdata$respvals)
+# location matrix: which response value corresponds to which study
+tdata$locmat <- matrix(ncol = n_studies, nrow = tdata$total_n, 0)
+for (i in 1:length(xdata)) tdata$locmat[studyid ==i, i] <- 1
+# n of observation per study
+tdata$n_per_study <- colSums(tdata$locmat)
+
+lapply(tdata, head, 3)
+```
+
+```{r stan3, message = FALSE, cache=TRUE}
+stancode3 <- "
+data {
+  int<lower=0> n_studies;
+  int<lower=0> total_n;
+  vector[total_n] respvals;
+  vector[total_n] cont;
+  vector[total_n] bin;
+  matrix[total_n, n_studies] locmat;
+  int n_per_study[n_studies];
+}
+parameters {
+  real goal1;
+  real<lower=0> goal1_sigma;
+  real goal2;
+  real<lower=0> goal2_sigma;
+  vector<lower=0>[n_studies] study_sigma; 
+  vector[n_studies] study_intercept; 
+  vector[n_studies] study_eff_cont; 
+  vector[n_studies] study_eff_bin;
+}
+model {
+  for (n in 1:n_studies) {
+    // create temporary vectors for data (depending on the n in the given study)
+    vector[n_per_study[n]] response;
+    vector[n_per_study[n]] pred_cont;
+    vector[n_per_study[n]] pred_bin;
+    int pos;
+    pos = 1;
+    // fill with the actual data values (i.e. the raw data for a given study)
+    for (i in 1:rows(locmat)) {
+      if (locmat[i, n]) {
+        response[pos] = respvals[i];
+        pred_cont[pos] = cont[i];
+        pred_bin[pos] = bin[i];
+        pos = pos + 1;
+      }
+    }
+    // the model for the means
+    // might be possible to move this to a generated quantities block?
+    study_sigma[n] ~ cauchy(1, 5);
+    study_intercept[n] ~ normal(0, 50);
+    study_eff_cont[n] ~ normal(0, 50);
+    study_eff_bin[n] ~ normal(0, 50);
+    response ~ normal(study_intercept[n] + study_eff_cont[n] * pred_cont + study_eff_bin[n] * pred_bin, study_sigma[n]);
+  }
+  goal1 ~ normal(0, 50);
+  goal1_sigma ~ cauchy(1, 5);
+  study_eff_bin ~ normal(goal1, goal1_sigma);
+  goal2 ~ normal(0, 50);
+  goal2_sigma ~ cauchy(1, 5);
+  study_eff_cont ~ normal(goal2, goal2_sigma);
+  
+
+}
+"
+
+stan_mod3 <- stan_model(model_code = stancode3)
+```
+
+
+```{r stan3_sample1, cache=use_sample_cache}
+fit3 <- sampling(object = stan_mod3, data = tdata, 
+                 iter = 4000, chains = 4, cores = 4, refresh = refresh)
+```
+
+```{r stan3_sample2, cache=use_sample_cache}
+fit3b <- sampling(object = stan_mod3, data = tdata, 
+                 iter = 8000, chains = 4, cores = 4, refresh = refresh)
+```
+
+```{r, echo=FALSE, eval=FALSE}
+cfp::cacheload("stan3")
+cfp::cacheload("stan3_sample1")
+cfp::cacheload("stan3_sample2")
+```
+
+
+Remember: the code for `my_dens` is in 'meta_regression_part1'...
+
+```{r}
+x <- extract(fit3b)$goal2
+my_dens(x)
+mean(x)
+goal2_sample
+x <- extract(fit3b)$goal1
+my_dens(x)
+mean(x)
+goal1_sample
+```
+
+
+
+```{r, fig.cap = "\\texttt{stan} model 3 with 6,000 iterations"}
+par(mfrow = c(2, 2), family = "serif", las = 1)
+plot(templatedata$eff_con, colMeans(extract(fit3)$study_eff_cont),
+     xlab = "input", ylab = "modelled", main = "continuous")
+abline(0, 1, lty = 2)
+plot(templatedata$eff_bin, colMeans(extract(fit3)$study_eff_bin),
+     xlab = "input", ylab = "modelled", main = "binary")
+abline(0, 1, lty = 2)
+```
+
+```{r, fig.cap = "\\texttt{stan} model 3 with 12,000 iterations"}
+par(mfrow = c(1, 2), family = "serif", las = 1)
+plot(templatedata$eff_con, colMeans(extract(fit3b)$study_eff_cont), xlab = "input", ylab = "modelled", main = "continuous")
+abline(0, 1, lty = 2)
+plot(templatedata$eff_bin, colMeans(extract(fit3b)$study_eff_bin), xlab = "input", ylab = "modelled", main = "binary")
+abline(0, 1, lty = 2)
+```
+
+
+# running models with two different structures per submodel
+
+Here I will try to use the same generated data with the same goals as before. The difference is that I will fit two models per data set: (1) with both predictors and (2) only use the binary predictor. I will try to keep both approaches as separated as possible.
+
+```{r stan4, message = FALSE, cache=TRUE}
+stancode4 <- "
+data {
+  int<lower=0> n_studies;
+  int<lower=0> total_n;
+  vector[total_n] respvals;
+  vector[total_n] cont;
+  vector[total_n] bin;
+  matrix[total_n, n_studies] locmat;
+  int n_per_study[n_studies];
+}
+parameters {
+  real goal1;
+  real<lower=0> goal1_sigma;
+  // real goal2;
+  // real goal_alt1;
+  // real goal_alt2;
+  vector<lower=0>[n_studies] study_sigma; 
+  vector[n_studies] study_intercept; 
+  vector[n_studies] study_eff_bin;
+  vector[n_studies] study_eff_cont; 
+  // for the alternative model
+  vector<lower=0>[n_studies] study_alt_sigma; 
+  vector[n_studies] study_alt_intercept; 
+  vector[n_studies] study_alt_eff_bin;
+}
+model {
+  for (m in 1:2) {
+    for (n in 1:n_studies) {
+      // create temporary vectors for data (depending on the n in the given study)
+      vector[n_per_study[n]] response;
+      vector[n_per_study[n]] pred_cont;
+      vector[n_per_study[n]] pred_bin;
+      int pos;
+      pos = 1;
+      // fill with the actual data values (i.e. the raw data for a given study)
+      for (i in 1:rows(locmat)) {
+        if (locmat[i, n]) {
+          response[pos] = respvals[i];
+          pred_cont[pos] = cont[i];
+          pred_bin[pos] = bin[i];
+          pos = pos + 1;
+        }
+      }
+      if (m == 1) {
+        study_sigma[n] ~ cauchy(1, 5);
+        study_intercept[n] ~ normal(0, 50);
+        study_eff_cont[n] ~ normal(0, 50);
+        study_eff_bin[n] ~ normal(0, 50);
+        response ~ normal(study_intercept[n] + study_eff_cont[n] * pred_cont + study_eff_bin[n] * pred_bin, study_sigma[n]);
+      }
+      if (m == 2) {
+        study_alt_sigma[n] ~ cauchy(1, 5);
+        study_alt_intercept[n] ~ normal(0, 50);
+        study_alt_eff_bin[n] ~ normal(0, 50);
+        response ~ normal(study_alt_intercept[n] + study_alt_eff_bin[n] * pred_bin, study_alt_sigma[n]);
+      }
+      
+      
+    }
+  }
+
+  goal1 ~ normal(0, 50);
+  goal1_sigma ~ cauchy(1, 5);
+  study_eff_bin ~ normal(goal1, goal1_sigma);
+}
+"
+
+stan_mod4 <- stan_model(model_code = stancode4)
+```
+
+
+```{r stan4_sample1, cache=use_sample_cache}
+fit4 <- sampling(object = stan_mod4, data = tdata, 
+                 iter = 4000, chains = 4, cores = 4, refresh = refresh)
+```
+
+```{r, eval = FALSE}
+# fit4 <- stan(model_code = stancode4, data = tdata, iter = 4000, chains = 3, cores = 3, refresh = refresh)
+# summary(fit4)$summary["goal1", "mean"]
+# mean(templatedata$eff_bin)
+# my_dens(extract(fit4)$goal1, span = 0.08)
+```
+
+
+```{r, fig.cap = "\\texttt{stan} model 4 with 8,000 iterations", eval = FALSE}
+par(mfrow = c(1, 2), family = "serif", las = 1)
+plot(templatedata$eff_bin, colMeans(extract(fit4)$study_eff_bin), xlab = "input", ylab = "modelled", main = "binary from two predictors")
+abline(0, 1, lty = 2)
+plot(templatedata$eff_bin, colMeans(extract(fit4)$study_alt_eff_bin), xlab = "input", ylab = "modelled", main = "binary as single")
+abline(0, 1, lty = 2)
+```
+
+
+
+
+

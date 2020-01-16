@@ -17,19 +17,22 @@ knitr::opts_chunk$set(size = 'footnotesize', fig.align = 'center', echo = TRUE)
 options(width = 118)
 ```
 
-The idea is here to simulate a process that is truly hierarchical. To this end we will setup a process that ends in the generation of a response (*`resp`*). This response depends on a predictor, which in turn depends on a covariate.
-
-covariate $\longrightarrow$ predictor $\longrightarrow$ response
-
-response ~ (predictor ~ covariate)
-
-
 ```{r packageload, message = FALSE, warning=FALSE}
 library(lme4)
 library(knitr)
 library(knitrProgressBar)
 library(RColorBrewer)
 ```
+
+
+The idea is here to simulate a process that is truly hierarchical. To this end we will set up a process that ends in the generation of a response (*`resp`*). This response depends on a predictor, which in turn depends on a covariate.
+
+covariate $\longrightarrow$ predictor $\longrightarrow$ response
+
+response ~ (predictor ~ covariate)
+
+
+
 
 
 
@@ -60,7 +63,7 @@ Next, we create the **covariate, which is a subject-level variable**, i.e. each 
 
   1) Assume that the covariate itself is independent of the grouping, i.e. all groups have approximately the same average value here. If this covariate is, for example, SES, then we assume the scale it is measured with is group-specific (e.g. a country-specific SES scale).
   
-  2) Assume that the covariate is grouping-dependent, i.e. groups have different means. For example, SES might be measured on a global scale.
+  2) Assume that the covariate is grouping-dependent, i.e. groups have different means. For example, SES might be measured with a globally valid scale, and SES values might be comparable accross countries.
 
 As a result of this, we find that the mean covariate values per group are approximately identical (figure \ref{fig:covariatemeans} top left) in the first case, and more spread out in the scond case (figure \ref{fig:covariatemeans} top right).
 
